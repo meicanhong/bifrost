@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -109,9 +110,9 @@ func (provider *OpenRouterProvider) validateKey(ctx *schemas.BifrostContext, key
 	return nil
 }
 
-// fetchEmbeddingModels fetches OpenRouter's embedding-model catalog. Best-effort: any
+// fetchSupplementalModels fetches a catalog omitted by the default models endpoint. Best-effort: any
 // failure is logged and swallowed so it never fails the primary ListModels call.
-func (provider *OpenRouterProvider) fetchEmbeddingModels(ctx *schemas.BifrostContext, key schemas.Key) []schemas.Model {
+func (provider *OpenRouterProvider) fetchSupplementalModels(ctx *schemas.BifrostContext, key schemas.Key, path string) []schemas.Model {
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseRequest(req)
@@ -119,7 +120,7 @@ func (provider *OpenRouterProvider) fetchEmbeddingModels(ctx *schemas.BifrostCon
 
 	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
 
-	req.SetRequestURI(provider.networkConfig.BaseURL + "/v1/embeddings/models")
+	req.SetRequestURI(provider.networkConfig.BaseURL + path)
 	req.Header.SetMethod(http.MethodGet)
 	req.Header.SetContentType("application/json")
 	if keyValue := key.Value.GetValue(); keyValue != "" {
@@ -129,16 +130,16 @@ func (provider *OpenRouterProvider) fetchEmbeddingModels(ctx *schemas.BifrostCon
 	_, bifrostErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
 	defer wait()
 	if bifrostErr != nil || resp.StatusCode() != fasthttp.StatusOK {
-		provider.logger.Debug("openrouter: failed to fetch embedding models, skipping")
+		provider.logger.Debug("openrouter: failed to fetch supplemental models at %s, skipping", path)
 		return nil
 	}
 
-	var embeddingResponse schemas.BifrostListModelsResponse
-	if _, _, bifrostErr := providerUtils.HandleProviderResponse(resp.Body(), &embeddingResponse, nil, false, false); bifrostErr != nil {
-		provider.logger.Debug("openrouter: failed to parse embedding models response, skipping")
+	var supplementalResponse schemas.BifrostListModelsResponse
+	if _, _, bifrostErr := providerUtils.HandleProviderResponse(resp.Body(), &supplementalResponse, nil, false, false); bifrostErr != nil {
+		provider.logger.Debug("openrouter: failed to parse supplemental models response at %s, skipping", path)
 		return nil
 	}
-	return embeddingResponse.Data
+	return supplementalResponse.Data
 }
 
 // listModelsByKey performs a list models request for a single key.
@@ -218,15 +219,18 @@ func (provider *OpenRouterProvider) listModelsByKey(ctx *schemas.BifrostContext,
 		}
 	}
 
-	// Merge in the embedding-model catalog, which OpenRouter's default /v1/models
-	// response omits entirely.
+	// Merge catalogs omitted by OpenRouter's default /v1/models response.
+	// The shared pipeline below still enforces allowlists and blacklists.
 	if modelsFetched {
-		if embeddingModels := provider.fetchEmbeddingModels(ctx, key); len(embeddingModels) > 0 {
+		if supplementalModels := slices.Concat(
+			provider.fetchSupplementalModels(ctx, key, "/v1/embeddings/models"),
+			provider.fetchSupplementalModels(ctx, key, "/v1/models?output_modalities=rerank"),
+		); len(supplementalModels) > 0 {
 			existing := make(map[string]bool, len(openrouterResponse.Data))
 			for _, m := range openrouterResponse.Data {
 				existing[strings.ToLower(m.ID)] = true
 			}
-			for _, m := range embeddingModels {
+			for _, m := range supplementalModels {
 				if !existing[strings.ToLower(m.ID)] {
 					openrouterResponse.Data = append(openrouterResponse.Data, m)
 					existing[strings.ToLower(m.ID)] = true
@@ -479,9 +483,16 @@ func (provider *OpenRouterProvider) Speech(ctx *schemas.BifrostContext, key sche
 	)
 }
 
-// Rerank is not supported by the OpenRouter provider.
+// Rerank submits a text reranking request to OpenRouter's OpenAI-compatible endpoint.
 func (provider *OpenRouterProvider) Rerank(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostRerankRequest) (*schemas.BifrostRerankResponse, *schemas.BifrostError) {
-	return nil, providerUtils.NewUnsupportedOperationError(schemas.RerankRequest, provider.GetProviderKey())
+	return openai.HandleOpenAIRerankRequest(
+		ctx, provider.client,
+		provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/rerank"),
+		request, key, provider.networkConfig.ExtraHeaders, provider.GetProviderKey(),
+		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		provider.logger,
+	)
 }
 
 // OCR is not supported by the Openrouter provider.

@@ -22,6 +22,7 @@ OpenRouter is an **OpenAI-compatible provider routing service** that accesses mo
 | Text Completions | ✅ | ✅ | `/v1/completions` |
 | List Models | ✅ | - | `/v1/models` |
 | Embeddings | ✅ | - | `/v1/embeddings` |
+| Rerank | ✅ | - | `/v1/rerank` |
 | Speech (TTS) | ✅ | ❌ | `/v1/audio/speech` |
 | Transcriptions (STT) | ✅ | ❌ | `/v1/audio/transcriptions` |
 | Image Generation | ❌ | ❌ | - |
@@ -325,3 +326,30 @@ Streaming Speech and Transcription are not supported by the upstream OpenRouter 
 **Impact**: Longer user identifiers are lost
 **Code**: SanitizeUserField enforces 64-char max
 </Accordion>
+
+
+## Rerank
+
+Use the native Bifrost endpoint with an explicit OpenRouter provider prefix:
+
+```bash
+curl "$BIFROST_URL/v1/rerank" \
+  -H "Content-Type: application/json" \
+  -H "x-bf-vk: $BIFROST_VIRTUAL_KEY" \
+  -d '{
+    "model": "openrouter/voyageai/rerank-3-lite",
+    "query": "Which document describes an apple?",
+    "documents": ["A car has four wheels.", "An apple is a fruit."],
+    "top_n": 1,
+    "return_documents": true
+  }'
+```
+
+Bifrost supplements OpenRouter's default model list with
+`/v1/models?output_modalities=rerank`, then applies the existing model allowlist,
+blacklist, and alias rules. A failed supplemental discovery does not break the
+primary model list. Refresh the provider's models after upgrading.
+
+The response preserves upstream `usage.total_tokens`, `usage.search_units`, and
+`usage.cost` when provided. A zero token price in the model catalog does not mean
+reranking is free; use the upstream billing record for actual charges.

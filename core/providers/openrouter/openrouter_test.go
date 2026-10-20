@@ -1,6 +1,12 @@
 package openrouter_test
 
 import (
+	"context"
+	"encoding/json"
+	bifrost "github.com/maximhq/bifrost/core"
+	"github.com/maximhq/bifrost/core/providers/openrouter"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -65,4 +71,122 @@ func TestOpenRouter(t *testing.T) {
 	t.Run("OpenRouterTests", func(t *testing.T) {
 		llmtests.RunAllComprehensiveTests(t, client, ctx, testConfig)
 	})
+}
+
+// TestOpenRouterRerank exercises the native provider against the upstream wire contract.
+func TestOpenRouterRerank(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/rerank" || r.Method != "POST" || r.Header.Get("Authorization") != "Bearer test-key" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if body["model"] != "voyageai/rerank-3-lite" || body["query"] != "fruit" || body["top_n"] != float64(1) {
+			t.Errorf("unexpected body: %v", body)
+		}
+		docs, ok := body["documents"].([]interface{})
+		if !ok || len(docs) != 2 {
+			t.Errorf("unexpected documents: %v", body["documents"])
+		} else if doc, ok := docs[1].(map[string]interface{}); !ok || doc["text"] != "apple" {
+			t.Errorf("unexpected document: %v", docs[1])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"rerank-test","results":[{"index":1,"relevance_score":0.9}],"usage":{"total_tokens":150,"search_units":1,"cost":0.00001}}`))
+	}))
+	defer server.Close()
+	provider := openrouter.NewOpenRouterProvider(&schemas.ProviderConfig{NetworkConfig: schemas.NetworkConfig{BaseURL: server.URL, AllowPrivateNetwork: true}}, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	result, err := provider.Rerank(ctx, schemas.Key{Value: schemas.SecretVar{Val: "test-key"}}, &schemas.BifrostRerankRequest{Model: "voyageai/rerank-3-lite", Query: "fruit", Documents: []schemas.RerankDocument{{Text: "car"}, {Text: "apple"}}, Params: &schemas.RerankParameters{TopN: schemas.Ptr(1), ReturnDocuments: schemas.Ptr(true)}})
+	if err != nil {
+		t.Fatalf("rerank failed: %+v", err)
+	}
+	if len(result.Results) != 1 || result.Results[0].Index != 1 || result.Results[0].Document == nil || result.Results[0].Document.Text != "apple" {
+		t.Fatalf("unexpected results: %+v", result)
+	}
+	if result.Usage == nil || result.Usage.TotalTokens != 150 || result.Usage.SearchUnits == nil || *result.Usage.SearchUnits != 1 || result.Usage.Cost == nil || result.Usage.Cost.TotalCost != 0.00001 {
+		t.Fatalf("lost usage: %+v", result.Usage)
+	}
+}
+
+func TestOpenRouterRerankModels(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("output_modalities") == "rerank" {
+			w.Write([]byte(`{"data":[{"id":"voyageai/rerank-3-lite"},{"id":"voyageai/rerank-3-lite"}]}`))
+			return
+		}
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer server.Close()
+	provider := openrouter.NewOpenRouterProvider(&schemas.ProviderConfig{NetworkConfig: schemas.NetworkConfig{BaseURL: server.URL, AllowPrivateNetwork: true}}, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	for _, blocked := range []bool{false, true} {
+		key := schemas.Key{Value: schemas.SecretVar{Val: "test-key"}, Models: schemas.WhiteList{"*"}}
+		if blocked {
+			key.BlacklistedModels = schemas.BlackList{"voyageai/rerank-3-lite"}
+		}
+		result, err := provider.ListModels(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), []schemas.Key{key}, &schemas.BifrostListModelsRequest{})
+		if err != nil {
+			t.Fatalf("list failed: %+v", err)
+		}
+		want := 1
+		if blocked {
+			want = 0
+		}
+		if len(result.Data) != want {
+			t.Fatalf("blocked=%v: expected %d models, got %+v", blocked, want, result.Data)
+		}
+		if !blocked && result.Data[0].ID != "openrouter/voyageai/rerank-3-lite" {
+			t.Fatalf("wrong ID: %s", result.Data[0].ID)
+		}
+	}
+}
+
+func TestOpenRouterRerankUpstreamError(t *testing.T) {
+	for _, status := range []int{401, 429, 500} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				w.Write([]byte(`{"error":{"message":"upstream rejected request","type":"provider_error"}}`))
+			}))
+			defer server.Close()
+			provider := openrouter.NewOpenRouterProvider(&schemas.ProviderConfig{NetworkConfig: schemas.NetworkConfig{BaseURL: server.URL, AllowPrivateNetwork: true}}, bifrost.NewDefaultLogger(schemas.LogLevelError))
+			result, err := provider.Rerank(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), schemas.Key{}, &schemas.BifrostRerankRequest{Model: "voyageai/rerank-3-lite", Query: "fruit", Documents: []schemas.RerankDocument{{Text: "apple"}}})
+			if result != nil || err == nil || err.StatusCode == nil || *err.StatusCode != status {
+				t.Fatalf("expected HTTP %d, got response=%+v error=%+v", status, result, err)
+			}
+		})
+	}
+}
+
+func TestOpenRouterSupplementalCatalogFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("output_modalities") == "rerank" {
+			w.WriteHeader(503)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/embeddings/models" {
+			w.Write([]byte(`{"data":[{"id":"qwen/embedding"}]}`))
+			return
+		}
+		w.Write([]byte(`{"data":[{"id":"openai/chat"}]}`))
+	}))
+	defer server.Close()
+	provider := openrouter.NewOpenRouterProvider(&schemas.ProviderConfig{NetworkConfig: schemas.NetworkConfig{BaseURL: server.URL, AllowPrivateNetwork: true}}, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	result, err := provider.ListModels(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), []schemas.Key{{Models: schemas.WhiteList{"*"}}}, &schemas.BifrostListModelsRequest{})
+	if err != nil || len(result.Data) != 2 {
+		t.Fatalf("primary and embedding catalogs must survive: result=%+v err=%+v", result, err)
+	}
+}
+
+func TestOpenRouterRerankMalformedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{not-json`)) }))
+	defer server.Close()
+	provider := openrouter.NewOpenRouterProvider(&schemas.ProviderConfig{NetworkConfig: schemas.NetworkConfig{BaseURL: server.URL, AllowPrivateNetwork: true}}, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	result, err := provider.Rerank(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), schemas.Key{}, &schemas.BifrostRerankRequest{Model: "voyageai/rerank-3-lite", Query: "fruit", Documents: []schemas.RerankDocument{{Text: "apple"}}})
+	if result != nil || err == nil {
+		t.Fatalf("malformed upstream response must fail: result=%+v err=%+v", result, err)
+	}
 }

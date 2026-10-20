@@ -150845,6 +150845,49 @@
           "response": []
         }
       ]
+    },
+    {
+      "name": "93. OpenRouter rerank regression",
+      "item": [
+        {
+          "name": "OpenRouter rerank native voyageai/rerank-3-lite",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"model\": \"openrouter/voyageai/rerank-3-lite\", \"query\": \"Which fruit is an apple?\", \"documents\": [\"A car has four wheels.\", \"An apple is a fruit.\"], \"top_n\": 1, \"return_documents\": true}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/rerank",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "rerank"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('OpenRouter rerank succeeds', function () { pm.expect(pm.response.code, pm.response.text()).to.eql(200); });",
+                  "pm.test('Relevant document ranks first', function () { const body = pm.response.json(); pm.expect(body.results).to.have.lengthOf(1); pm.expect(body.results[0].index).to.eql(1); pm.expect(body.results[0].relevance_score).to.be.a('number'); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }
